@@ -5,14 +5,16 @@ import json
 import re
 from collections import OrderedDict
 import unicodedata
+from typing import Optional, Tuple, Dict
 
 from twitchio.ext import commands
 from googletrans import Translator
 import spacy
-# from spellchecker import SpellChecker  # indexerエラーのためコメントアウト
+# from spellchecker import SpellChecker
 import langdetect
-from dotenv import load_dotenv  # .envファイル読み込み用
+from dotenv import load_dotenv
 import urllib.request
+import time
 
 # ログ設定
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,7 +26,9 @@ load_dotenv()
 CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("TWITCH_ACCESS_TOKEN")
 CHANNEL = os.getenv("TWITCH_CHANNEL")
-TRANSLATION_CACHE_SIZE = os.getenv("TRANSLATION_CACHE_SIZE", "100")  # デフォルト値は100
+TRANSLATION_CACHE_SIZE = os.getenv("TRANSLATION_CACHE_SIZE", "100")
+TRANSLATION_RETRY_COUNT = int(os.getenv("TRANSLATION_RETRY_COUNT", "3"))  # リトライ回数のデフォルト値
+TRANSLATION_RETRY_DELAY = int(os.getenv("TRANSLATION_RETRY_DELAY", "1"))  # リトライ間隔のデフォルト値
 
 print(f"Client ID: {CLIENT_ID}")
 print(f"Access Token: {ACCESS_TOKEN}")
@@ -44,34 +48,51 @@ except ValueError:
     logging.error("環境変数TRANSLATION_CACHE_SIZEは整数である必要があります。デフォルト値100を使用します。")
     TRANSLATION_CACHE_SIZE = 100
 
+# 翻訳リトライ回数と間隔の確認
+try:
+    TRANSLATION_RETRY_COUNT = int(TRANSLATION_RETRY_COUNT)
+    if TRANSLATION_RETRY_COUNT < 0:
+        raise ValueError("TRANSLATION_RETRY_COUNTは0以上の整数である必要があります")
+except ValueError:
+    logging.error(
+        "環境変数TRANSLATION_RETRY_COUNTは0以上の整数である必要があります。デフォルト値3を使用します。"
+    )
+    TRANSLATION_RETRY_COUNT = 3
+
+try:
+    TRANSLATION_RETRY_DELAY = int(TRANSLATION_RETRY_DELAY)
+    if TRANSLATION_RETRY_DELAY < 0:
+        raise ValueError("TRANSLATION_RETRY_DELAYは0以上の整数である必要があります")
+except ValueError:
+    logging.error(
+        "環境変数TRANSLATION_RETRY_DELAYは0以上の整数である必要があります。デフォルト値1を使用します。"
+    )
+    TRANSLATION_RETRY_DELAY = 1
+
 # 翻訳機能の初期化
 try:
     TRANSLATOR = Translator()
 except Exception as e:
     logging.error(f"Translatorの初期化に失敗しました: {e}", exc_info=True)
-    TRANSLATOR = None  # Translatorを使用不能にする
+    TRANSLATOR = None
 
 # NLPモデルの初期化
 try:
-    nlp = spacy.load("ja_core_news_sm")  # 日本語モデル
+    nlp = spacy.load("ja_core_news_sm")
 except OSError:
     print("spaCyの日本語モデルをダウンロード中...")
     spacy.cli.download("ja_core_news_sm")
     nlp = spacy.load("ja_core_news_sm")
 
-# # スペルチェッカーの初期化 (indexerエラーのためコメントアウト)
-# try:
-#     spell = SpellChecker(language='ja')
-# except ValueError as e:
-#     print(f"スペルチェッカーの初期化に失敗しました: {e}")
-#     print("日本語辞書ファイルがインストールされているか確認してください。")
-#     spell = None
+# スペルチェッカーの初期化
 spell = None
+
 
 class LRUCache:
     """
     LRU (Least Recently Used) キャッシュクラス。
     """
+
     def __init__(self, capacity):
         self.capacity = capacity
         self.cache = OrderedDict()
@@ -92,12 +113,14 @@ class LRUCache:
                 self.cache.popitem(last=False)
             self.cache[key] = value
 
+
 # fasttextモデルのロード
-USE_FASTTEXT = False  # fasttextが利用可能かどうかを示すフラグ
+USE_FASTTEXT = False
 try:
     import fasttext
+
     try:
-        ft_model = fasttext.load_model('lid.176.bin')  # 176言語対応モデル
+        ft_model = fasttext.load_model('lid.176.bin')
         USE_FASTTEXT = True
     except ValueError:
         print("fasttextモデルをダウンロード中...")
@@ -109,6 +132,7 @@ except ModuleNotFoundError:
     print("fasttextモジュールが見つかりませんでした。fasttextを使用しません。")
     ft_model = None
 
+
 def detect_language_with_confidence(text, min_prob=0.5):
     """
     テキストの言語を検出し、信頼度がmin_prob以上の場合のみ結果を返す。
@@ -118,9 +142,10 @@ def detect_language_with_confidence(text, min_prob=0.5):
         for lang in langs:
             if lang.prob > min_prob:
                 return lang.lang
-        return None  # 信頼できる言語が見つからなかった場合
+        return None
     except:
         return None
+
 
 def detect_language_ensemble(text):
     """
@@ -140,12 +165,12 @@ def detect_language_ensemble(text):
         if langdetect_result == fasttext_result:
             return langdetect_result
         elif langdetect_result and fasttext_result:
-            # 異なる結果の場合、langdetectの結果を優先
             return langdetect_result
         else:
             return langdetect_result or fasttext_result
     else:
         return langdetect_result
+
 
 def detect_language_safe(text):
     """
@@ -156,12 +181,23 @@ def detect_language_safe(text):
     except langdetect.LangDetectException:
         return None
 
+
 class Bot(commands.Bot):
     def __init__(self):
         super().__init__(token=ACCESS_TOKEN, prefix='!', initial_channels=[CHANNEL])
-        self.translation_cache = LRUCache(capacity=TRANSLATION_CACHE_SIZE)  # LRUキャッシュ
-        self.source_language = None  # 翻訳元の言語
-        self.translation_enabled = True  # 翻訳の有効/無効を切り替えるフラグ
+        self.translation_cache = LRUCache(capacity=TRANSLATION_CACHE_SIZE)
+        self.source_language = None
+        self.translation_enabled = True
+        self.translation_retry_count = TRANSLATION_RETRY_COUNT
+        self.translation_retry_delay = TRANSLATION_RETRY_DELAY
+        self.languages = {  # 翻訳可能な言語一覧
+            'en': '英語',
+            'ja': '日本語',
+            'ko': '韓国語',
+            'zh-cn': '中国語 (簡体字)',
+            'zh-tw': '中国語 (繁体字)',
+            # 必要に応じて他の言語を追加
+        }
 
     async def event_ready(self):
         print(f'準備完了 | {self.nick}')
@@ -175,47 +211,53 @@ class Bot(commands.Bot):
         else:
             await self.process_message(message)
 
-    # テキストの前処理
-    def preprocess_text(self, text):
+    def remove_html_tags(self, text: str) -> str:
+        """HTMLタグを削除する"""
+        return re.sub(r'<[^>]+>', '', text)
+
+    def remove_control_characters(self, text: str) -> str:
+        """制御文字を削除する"""
+        return ''.join(ch for ch in text if unicodedata.category(ch)[0] != 'C')
+
+    def normalize_whitespace(self, text: str) -> str:
+        """空白文字を正規化する"""
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+
+    def remove_symbols(self, text: str) -> str:
+        """記号を削除する"""
+        return re.sub(r'[^\w\s]', '', text)
+
+    def remove_urls_emails_phones(self, text: str) -> str:
+        """URL、メールアドレス、電話番号を削除する"""
+        text = re.sub(r'https?://\S+|www\.\S+', '', text)
+        text = re.sub(r'\S+@\S+', '', text)
+        text = re.sub(r'\d{3}-\d{3}-\d{4}', '', text)
+        return text
+
+    def unicode_normalize(self, text: str) -> str:
+        """Unicode正規化を行う"""
+        return unicodedata.normalize('NFKC', text)
+
+    def preprocess_text(self, text: str) -> str:
         """
         テキストの前処理を行う。
         """
         try:
-            # 1. 文字エンコーディングの統一 (UTF-8に変換)
             text = text.encode('utf-8', errors='ignore').decode('utf-8')
-
-            # 2. 不要な文字の削除 (HTMLタグ、制御文字など)
-            text = re.sub(r'<[^>]+>', '', text)  # HTMLタグの削除
-            text = ''.join(ch for ch in text if unicodedata.category(ch)[0] != 'C')  # 制御文字の削除
-
-            # 3. 空白文字の正規化
-            text = re.sub(r'\s+', ' ', text)  # 連続する空白文字を1つに
-            text = text.strip()  # 前後の空白を削除
-
-            # 4. 大文字・小文字の統一 (必要に応じて)
-            # text = text.lower()
-
-            # 5. 記号の処理 (必要に応じて)
-            text = re.sub(r'[^\w\s]', '', text)  # 記号の削除 (英数字、空白以外)
-
-            # 6. URL、メールアドレス、電話番号などの処理 (必要に応じて)
-            text = re.sub(r'https?://\S+|www\.\S+', '', text)  # URLの削除
-            text = re.sub(r'\S+@\S+', '', text)  # メールアドレスの削除
-            text = re.sub(r'\d{3}-\d{3}-\d{4}', '', text)  # 電話番号の削除
-
-            # 7. Unicode正規化
-            text = unicodedata.normalize('NFKC', text)
-
-            # 8. スラングの正規化
+            text = self.remove_html_tags(text)
+            text = self.remove_control_characters(text)
+            text = self.normalize_whitespace(text)
+            text = self.remove_symbols(text)
+            text = self.remove_urls_emails_phones(text)
+            text = self.unicode_normalize(text)
             text = self.normalize_slang(text)
-
             return text
         except Exception as e:
             logging.error(f"テキストの前処理中にエラーが発生しました: {e}", exc_info=True)
-            return text  # エラーが発生した場合は、元のテキストを返す
+            return text
 
-    # スラングの正規化
-    def normalize_slang(self, text):
+    def normalize_slang(self, text: str) -> str:
         """
         スラングを正規化する。
         """
@@ -230,7 +272,7 @@ class Bot(commands.Bot):
             return text
         except Exception as e:
             logging.error(f"スラングの正規化中にエラーが発生しました: {e}", exc_info=True)
-            return text  # エラーが発生した場合は、元のテキストを返す
+            return text
 
     async def process_message(self, message):
         """
@@ -239,46 +281,37 @@ class Bot(commands.Bot):
         content = message.content
 
         try:
-            # 翻訳が無効な場合は、メッセージを処理しない
             if not self.translation_enabled:
                 return
 
-            # 0. 言語の特定
-            try:
-                detected_language = detect_language_ensemble(content)
-                if not detected_language:
-                    detected_language = 'ja'  # 検出失敗時は日本語とする
-            except Exception as e:
-                logging.error(f"言語検出エラー: {e}", exc_info=True)
-                detected_language = 'ja'  # 検出失敗時は日本語とする
+            detected_language = detect_language_ensemble(content)
+            if not detected_language:
+                detected_language = 'ja'
 
-            # 1. テキストの前処理
             preprocessed_text = self.preprocess_text(content)
 
-            # 2. メッセージを翻訳
-            try:
-                translated_text, detected_language = await self.translate_message(preprocessed_text, source_language=self.source_language)
-            except Exception as e:
-                logging.error(f"翻訳中にエラーが発生しました: {e}", exc_info=True)
-                await message.channel.send("翻訳中にエラーが発生しました。")
-                return
+            translated_text, detected_language = await self.translate_message(
+                preprocessed_text, source_language=self.source_language
+            )
 
-            # 3. 翻訳されたメッセージをチャットに表示
             if detected_language != 'ja':
-                await message.channel.send(f"[{detected_language}] {content} (日本語訳: {translated_text})")
+                await message.channel.send(
+                    f"[{detected_language}] {content} (日本語訳: {translated_text})"
+                )
 
         except Exception as e:
             logging.exception(f"メッセージ処理エラー:", exc_info=True)
             await message.channel.send("メッセージの処理中にエラーが発生しました。")
 
-    async def translate_message(self, text, target_language='ja', source_language=None):
+    async def translate_message(
+        self, text: str, target_language: str = 'ja', source_language: Optional[str] = None
+    ) -> Tuple[str, str]:
         """
         メッセージを翻訳し、翻訳されたテキストと検出された言語を返す。
         翻訳結果はキャッシュに保存される。
         """
-        # Translatorが初期化されていない場合は、翻訳をスキップ
         if TRANSLATOR is None:
-            return text, 'ja'  # 元のテキストと日本語を返す
+            return text, 'ja'
 
         cache_key = (text, target_language, source_language)
         cached_result = self.translation_cache.get(cache_key)
@@ -287,22 +320,39 @@ class Bot(commands.Bot):
             logging.info(f"翻訳キャッシュから取得: {text}")
             return cached_result['translated_text'], cached_result['detected_language']
 
-        try:
-            translation = TRANSLATOR.translate(text, dest=target_language, src=source_language)
-            translated_text = translation.text
-            detected_language = translation.src
-            self.translation_cache.put(cache_key, {'translated_text': translated_text, 'detected_language': detected_language})
-            return translated_text, detected_language
-        except Exception as e:
-            logging.error(f"翻訳エラー: {e}", exc_info=True)
-            await message.channel.send(f"翻訳中にエラーが発生しました: {e}")  # ユーザーにエラーを通知
-            return "[翻訳エラー] " + text, 'ja'  # エラーが発生した場合は、元のテキストと日本語を返す
+        for attempt in range(self.translation_retry_count + 1):
+            try:
+                translation = TRANSLATOR.translate(
+                    text, dest=target_language, src=source_language
+                )
+                translated_text = translation.text
+                detected_language = translation.src
+                self.translation_cache.put(
+                    cache_key,
+                    {'translated_text': translated_text, 'detected_language': detected_language},
+                )
+                return translated_text, detected_language
+            except Exception as e:
+                logging.error(
+                    f"翻訳エラー (試行{attempt + 1}/{self.translation_retry_count + 1}): {e}",
+                    exc_info=True,
+                )
+                if attempt < self.translation_retry_count:
+                    await asyncio.sleep(self.translation_retry_delay)  # リトライ待機
+                else:
+                    # await message.channel.send(f"翻訳中にエラーが発生しました: {e}") #messageが定義されていないので削除
+                    return "[翻訳エラー] " + text, 'ja'
 
     @commands.command(name='set_source_language')
     async def set_source_language(self, ctx: commands.Context, source_language: str):
         """
         翻訳元の言語を設定するコマンド。
         """
+        if source_language not in self.languages:
+            await ctx.send(
+                f'{ctx.author.name}、無効な言語コードです。翻訳可能な言語コードは、!languages コマンドで確認してください。'
+            )
+            return
         self.source_language = source_language
         await ctx.send(f'{ctx.author.name}、翻訳元の言語を "{source_language}" に設定しました。')
 
@@ -314,6 +364,65 @@ class Bot(commands.Bot):
         self.translation_enabled = not self.translation_enabled
         status = "有効" if self.translation_enabled else "無効"
         await ctx.send(f'{ctx.author.name}、翻訳を{status}にしました。')
+
+    @commands.command(name='tr')
+    async def translate(self, ctx: commands.Context, target_language: str, *, text: str):
+        """
+        指定された言語に翻訳するコマンド。
+        """
+        if TRANSLATOR is None:
+            await ctx.send("翻訳機能が利用できません。")
+            return
+
+        if target_language not in self.languages:
+            await ctx.send(
+                f'{ctx.author.name}、無効な言語コードです。翻訳可能な言語コードは、!languages コマンドで確認してください。'
+            )
+            return
+
+        try:
+            translated_text, detected_language = await self.translate_message(
+                text, target_language=target_language
+            )
+            if detected_language != 'ja':
+                await ctx.send(
+                    f'{ctx.author.name}さんのメッセージ: "{text}" ({self.languages[target_language]}訳: "{translated_text}")'
+                )
+            else:
+                await ctx.send(
+                    f'{ctx.author.name}さんのメッセージ: "{text}" は日本語ではありません。'
+                )
+        except Exception as e:
+            logging.error(
+                f"{target_language}への翻訳中にエラーが発生しました: {e}", exc_info=True
+            )
+            await ctx.send(f'{ctx.author.name}、翻訳中にエラーが発生しました: {e}')
+
+    @commands.command(name='languages')
+    async def show_languages(self, ctx: commands.Context):
+        """
+        翻訳可能な言語一覧を表示するコマンド。
+        """
+        message = "翻訳可能な言語は以下の通りです:\n"
+        for code, name in self.languages.items():
+            message += f"{code}: {name}\n"
+        await ctx.send(message.strip())
+
+    @commands.command(name='set_retry')
+    async def set_retry(self, ctx: commands.Context, count: int, delay: int):
+        """
+        翻訳リトライ回数と間隔を設定するコマンド。
+        """
+        if count < 0 or delay < 0:
+            await ctx.send(
+                f'{ctx.author.name}、リトライ回数と間隔は0以上の整数で指定してください。'
+            )
+            return
+        self.translation_retry_count = count
+        self.translation_retry_delay = delay
+        await ctx.send(
+            f'{ctx.author.name}、翻訳リトライを{self.translation_retry_count}回、間隔{self.translation_retry_delay}秒に設定しました。'
+        )
 
 bot = Bot()
 bot.run()
