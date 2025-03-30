@@ -1,428 +1,432 @@
 import logging
 import os
 import asyncio
-import json
 import re
 from collections import OrderedDict
-import unicodedata
-from typing import Optional, Tuple, Dict
-
-from twitchio.ext import commands
-from googletrans import Translator
-import spacy
-# from spellchecker import SpellChecker
-import langdetect
+from typing import Optional, Tuple, List
 from dotenv import load_dotenv
-import urllib.request
+from twitchio.ext import commands
+import googletrans  # googletrans モジュール全体をインポート
+from googletrans import Translator, __version__, LANGUAGES
+import langdetect
+import config  # config.py を読み込む
+import spacy
 import time
 
-# ログ設定
+# --- ログ設定 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# .envファイルの読み込み
+# --- 環境変数の読み込み ---
 load_dotenv()
 
-# 環境変数から設定を読み込み
+# --- 環境変数から設定を取得 ---
 CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("TWITCH_ACCESS_TOKEN")
 CHANNEL = os.getenv("TWITCH_CHANNEL")
-TRANSLATION_CACHE_SIZE = os.getenv("TRANSLATION_CACHE_SIZE", "100")
-TRANSLATION_RETRY_COUNT = int(os.getenv("TRANSLATION_RETRY_COUNT", "3"))  # リトライ回数のデフォルト値
-TRANSLATION_RETRY_DELAY = int(os.getenv("TRANSLATION_RETRY_DELAY", "1"))  # リトライ間隔のデフォルト値
+TRANSLATION_CACHE_SIZE = int(os.getenv("TRANSLATION_CACHE_SIZE", 100))
 
-print(f"Client ID: {CLIENT_ID}")
-print(f"Access Token: {ACCESS_TOKEN}")
-print(f"Channel: {CHANNEL}")
+# --- config.py から設定を読み込み (存在しない場合のデフォルト値も設定) ---
+IGNORE_USERS = [user.lower() for user in getattr(config, 'IGNORE_USERS', [])]
+IGNORE_LINES = getattr(config, 'IGNORE_LINES', [])
+IGNORE_WORDS = [word.lower() for word in getattr(config, 'IGNORE_WORDS', [])]
+MAX_TRANSLATION_LENGTH = getattr(config, 'MAX_TRANSLATION_LENGTH', 500)
+MIN_TRANSLATION_LENGTH = getattr(config, 'MIN_TRANSLATION_LENGTH', 5)
+LANGUAGE_DETECTION_CONFIDENCE_THRESHOLD = getattr(config, 'LANGUAGE_DETECTION_CONFIDENCE_THRESHOLD', 0.80)
+JAPANESE_CHARACTER_THRESHOLD = getattr(config, 'JAPANESE_CHARACTER_THRESHOLD', 0.3)
+COMMON_SLANGS = [slang.lower() for slang in getattr(config, 'COMMON_SLANGS', ["gg", "lol", "pog", "kappa", "lmao", "omegalul", "kekw"])]
+IGNORE_URLS = getattr(config, 'IGNORE_URLS', True)
+IGNORE_MENTIONS = getattr(config, 'IGNORE_MENTIONS', True)
+TRANSLATION_RETRY_COUNT = getattr(config, 'TRANSLATION_RETRY_COUNT', 3)
+TRANSLATION_RETRY_DELAY = getattr(config, 'TRANSLATION_RETRY_DELAY', 1)
 
-if not CLIENT_ID:
-    raise ValueError("環境変数TWITCH_CLIENT_IDが設定されていません")
-if not ACCESS_TOKEN:
-    raise ValueError("環境変数TWITCH_TOKENが設定されていません")
-if not CHANNEL:
-    raise ValueError("環境変数TWITCH_CHANNELが設定されていません")
+# --- 必須の環境変数が設定されているか確認 ---
+if not all([CLIENT_ID, ACCESS_TOKEN, CHANNEL]):
+    raise ValueError("必要な環境変数が不足しています: TWITCH_CLIENT_ID, TWITCH_ACCESS_TOKEN, TWITCH_CHANNEL")
 
-# TRANSLATION_CACHE_SIZEが整数であることを確認
-try:
-    TRANSLATION_CACHE_SIZE = int(TRANSLATION_CACHE_SIZE)
-except ValueError:
-    logging.error("環境変数TRANSLATION_CACHE_SIZEは整数である必要があります。デフォルト値100を使用します。")
-    TRANSLATION_CACHE_SIZE = 100
+# --- Google Translate の初期化 ---
+translator = Translator()
+logger.info(f"googletrans のバージョン: {__version__}")
 
-# 翻訳リトライ回数と間隔の確認
-try:
-    TRANSLATION_RETRY_COUNT = int(TRANSLATION_RETRY_COUNT)
-    if TRANSLATION_RETRY_COUNT < 0:
-        raise ValueError("TRANSLATION_RETRY_COUNTは0以上の整数である必要があります")
-except ValueError:
-    logging.error(
-        "環境変数TRANSLATION_RETRY_COUNTは0以上の整数である必要があります。デフォルト値3を使用します。"
-    )
-    TRANSLATION_RETRY_COUNT = 3
-
-try:
-    TRANSLATION_RETRY_DELAY = int(TRANSLATION_RETRY_DELAY)
-    if TRANSLATION_RETRY_DELAY < 0:
-        raise ValueError("TRANSLATION_RETRY_DELAYは0以上の整数である必要があります")
-except ValueError:
-    logging.error(
-        "環境変数TRANSLATION_RETRY_DELAYは0以上の整数である必要があります。デフォルト値1を使用します。"
-    )
-    TRANSLATION_RETRY_DELAY = 1
-
-# 翻訳機能の初期化
-try:
-    TRANSLATOR = Translator()
-except Exception as e:
-    logging.error(f"Translatorの初期化に失敗しました: {e}", exc_info=True)
-    TRANSLATOR = None
-
-# NLPモデルの初期化
+# --- spaCyの日本語モデルをロード ---
 try:
     nlp = spacy.load("ja_core_news_sm")
 except OSError:
-    print("spaCyの日本語モデルをダウンロード中...")
-    spacy.cli.download("ja_core_news_sm")
-    nlp = spacy.load("ja_core_news_sm")
+    logger.warning("spaCyの日本語モデル 'ja_core_news_sm' が見つかりません。spaCyによる言語検出は無効になります。")
+    nlp = None
 
-# スペルチェッカーの初期化
-spell = None
+# --- Google Translateがサポートする言語コードのリスト ---
+SUPPORTED_LANGUAGES = LANGUAGES
 
-
+# --- LRUキャッシュ ---
 class LRUCache:
-    """
-    LRU (Least Recently Used) キャッシュクラス。
-    """
-
     def __init__(self, capacity):
         self.capacity = capacity
         self.cache = OrderedDict()
+        logger.info(f"LRUCache を初期化しました (capacity: {capacity})。")
 
     def get(self, key):
-        try:
-            value = self.cache.pop(key)
-            self.cache[key] = value
-            return value
-        except KeyError:
-            return None
+        if key in self.cache:
+            logger.debug(f"キャッシュヒット: {key}")
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        logger.debug(f"キャッシュミス: {key}")
+        return None
 
     def put(self, key, value):
+        if self.capacity == 0: return # キャッシュが無効なら何もしない
+        logger.debug(f"キャッシュに保存: {key}")
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        elif len(self.cache) >= self.capacity:
+            removed_key, _ = self.cache.popitem(last=False)
+            logger.debug(f"キャッシュから削除 (LRU): {removed_key}")
+        self.cache[key] = value
+
+translation_cache = LRUCache(TRANSLATION_CACHE_SIZE)
+
+# --- 翻訳関数 ---
+async def translate(text: str, target_language: str = 'ja') -> Optional[Tuple[str, str]]:
+    """テキストを翻訳し、翻訳結果とソース言語を返す。"""
+    if not text:
+        return None
+    cache_key = (text, target_language)
+    cached_result = translation_cache.get(cache_key)
+    if cached_result:
+        return cached_result
+
+    for attempt in range(TRANSLATION_RETRY_COUNT + 1):
         try:
-            self.cache.pop(key)
-        except KeyError:
-            if len(self.cache) >= self.capacity:
-                self.cache.popitem(last=False)
-            self.cache[key] = value
+            logger.debug(f"翻訳API呼び出し試行 {attempt + 1}/{TRANSLATION_RETRY_COUNT + 1}: '{text}' -> {target_language}")
+            translation = translator.translate(text, dest=target_language)
 
+            if translation and translation.text:
+                logger.debug(f"翻訳成功: '{text}' ({translation.src}) -> '{translation.text}' ({target_language})")
+                result = (translation.text, translation.src)
+                translation_cache.put(cache_key, result)
+                return result
+            else:
+                logger.warning(f"翻訳結果が無効です: {translation}")
+                if attempt < TRANSLATION_RETRY_COUNT:
+                    await asyncio.sleep(TRANSLATION_RETRY_DELAY)
+                else:
+                    logger.error(f"翻訳結果が無効なため、最終的に失敗とします: '{text}'")
+                    return None
 
-# fasttextモデルのロード
-USE_FASTTEXT = False
-try:
-    import fasttext
+        except googletrans.exceptions.TooManyRequests as e:  # 修正: googletrans.exceptions.TooManyRequests
+            logger.warning(f"翻訳APIレート制限 (試行 {attempt + 1}/{TRANSLATION_RETRY_COUNT + 1}): {e}")
+            if attempt < TRANSLATION_RETRY_COUNT:
+                await asyncio.sleep(TRANSLATION_RETRY_DELAY * (attempt + 1))
+            else:
+                logger.error(f"レート制限により翻訳失敗: '{text}'")
+                return None
+        except googletrans.exceptions.NotTranslated as e:  # 修正: googletrans.exceptions.NotTranslated
+            logger.warning(f"翻訳APIが空応答 (試行 {attempt + 1}/{TRANSLATION_RETRY_COUNT + 1}): '{text}'. リトライします。")
+            if attempt < TRANSLATION_RETRY_COUNT:
+                await asyncio.sleep(TRANSLATION_RETRY_DELAY)
+            else:
+                logger.error(f"翻訳APIが空応答を繰り返し失敗: '{text}'")
+                return None
+        except Exception as e:
+            logger.error(f"予期せぬ翻訳エラーが発生しました (試行 {attempt + 1}/{TRANSLATION_RETRY_COUNT + 1}): '{text}': {e}", exc_info=True)
+            return None
+    return None
 
+# --- 言語検出関数 ---
+def detect_language_spacy(text: str) -> Optional[str]:
+    """spaCyを使用して言語を検出する"""
+    if not nlp:
+        return None
     try:
-        ft_model = fasttext.load_model('lid.176.bin')
-        USE_FASTTEXT = True
-    except ValueError:
-        print("fasttextモデルをダウンロード中...")
-        url = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin"
-        urllib.request.urlretrieve(url, 'lid.176.bin')
-        ft_model = fasttext.load_model('lid.176.bin')
-        USE_FASTTEXT = True
-except ModuleNotFoundError:
-    print("fasttextモジュールが見つかりませんでした。fasttextを使用しません。")
-    ft_model = None
+        doc = nlp(text)
+        if doc.lang_:
+            logger.debug(f"spaCy detected: {doc.lang_}")
+            return doc.lang_
+        return None
+    except Exception as e:
+        logger.exception(f"spaCy言語検出でエラー：{e}")
+        return None
 
-
-def detect_language_with_confidence(text, min_prob=0.5):
-    """
-    テキストの言語を検出し、信頼度がmin_prob以上の場合のみ結果を返す。
-    """
+def detect_language_with_confidence(text: str) -> Optional[Tuple[str, float]]:
+    """langdetectを使用して言語とその信頼度を検出する"""
     try:
         langs = langdetect.detect_langs(text)
-        for lang in langs:
-            if lang.prob > min_prob:
-                return lang.lang
-        return None
-    except:
-        return None
-
-
-def detect_language_ensemble(text):
-    """
-    langdetectとfasttextの結果を組み合わせて言語を検出する。
-    """
-    try:
-        langdetect_result = detect_language_with_confidence(text)
-    except:
-        langdetect_result = None
-
-    if USE_FASTTEXT:
-        try:
-            fasttext_result = ft_model.predict(text)[0][0].replace('__label__', '')
-        except:
-            fasttext_result = None
-
-        if langdetect_result == fasttext_result:
-            return langdetect_result
-        elif langdetect_result and fasttext_result:
-            return langdetect_result
-        else:
-            return langdetect_result or fasttext_result
-    else:
-        return langdetect_result
-
-
-def detect_language_safe(text):
-    """
-    言語検出を行い、エラーが発生した場合はNoneを返す。
-    """
-    try:
-        return langdetect.detect(text)
+        if langs:
+            best_lang = langs[0]
+            logger.debug(f"langdetect detected: {best_lang.lang} (prob: {best_lang.prob:.4f})")
+            return best_lang.lang, best_lang.prob
+        return None, 0.0
     except langdetect.LangDetectException:
-        return None
+        logger.debug(f"langdetect cannot detect language: '{text}' (may be too short or no specific language features)")
+        return None, 0.0
+    except Exception as e:
+        logger.exception(f"langdetectで予期せぬエラー：{e}")
+        return None, 0.0
 
+# --- ヘルパー関数 ---
+def contains_significant_japanese(text: str, threshold: float) -> bool:
+    """メッセージ中の日本語文字(ひらがな、カタカナ、漢字)の割合が閾値以上か判定"""
+    if not text: return False
+    japanese_chars = 0
+    total_chars = 0
+    for char in text:
+        if char.strip():
+            total_chars += 1
+            if ('\u3040' <= char <= '\u309F') or \
+               ('\u30A0' <= char <= '\u30FF') or \
+               ('\u4E00' <= char <= '\u9FFF') or \
+               ('\uF900' <= char <= '\uFAFF') or \
+               ('\u3400' <= char <= '\u4DBF'):
+                japanese_chars += 1
 
+    if total_chars == 0: return False
+    ratio = japanese_chars / total_chars
+    logger.debug(f"日本語文字の割合: {ratio:.2f} (閾値: {threshold})")
+    return ratio >= threshold
+
+def remove_urls_mentions(text: str) -> Tuple[str, List[str], List[str]]:
+    """テキストからURLとメンションを削除し、元の要素をリストで返す"""
+    urls = []
+    mentions = []
+    processed_text = text
+
+    if IGNORE_URLS:
+        url_pattern = r'(https?://[^\s]+)'
+        urls = re.findall(url_pattern, processed_text)
+        processed_text = re.sub(url_pattern, '[URL]', processed_text)
+        logger.debug(f"削除されたURL: {urls}")
+
+    if IGNORE_MENTIONS:
+        mention_pattern = r'(@[a-zA-Z0-9_]+)'
+        mentions = re.findall(mention_pattern, processed_text)
+        processed_text = re.sub(mention_pattern, '[MENTION]', processed_text)
+        logger.debug(f"削除されたメンション: {mentions}")
+
+    return processed_text.strip(), urls, mentions
+
+# --- Botクラス ---
 class Bot(commands.Bot):
     def __init__(self):
-        super().__init__(token=ACCESS_TOKEN, prefix='!', initial_channels=[CHANNEL])
-        self.translation_cache = LRUCache(capacity=TRANSLATION_CACHE_SIZE)
-        self.source_language = None
+        super().__init__(token=ACCESS_TOKEN, client_id=CLIENT_ID, prefix='!', initial_channels=[CHANNEL])
         self.translation_enabled = True
-        self.translation_retry_count = TRANSLATION_RETRY_COUNT
-        self.translation_retry_delay = TRANSLATION_RETRY_DELAY
-        self.languages = {  # 翻訳可能な言語一覧
-            'en': '英語',
-            'ja': '日本語',
-            'ko': '韓国語',
-            'zh-cn': '中国語 (簡体字)',
-            'zh-tw': '中国語 (繁体字)',
-            # 必要に応じて他の言語を追加
-        }
+        logger.info("Bot を初期化しました。")
+        logger.info(f"無視するユーザー: {IGNORE_USERS}")
+        logger.info(f"無視する行パターン: {IGNORE_LINES}")
+        logger.info(f"無視する単語: {IGNORE_WORDS}")
+        logger.info(f"翻訳しない定型句: {COMMON_SLANGS}")
+        logger.info(f"最小翻訳長: {MIN_TRANSLATION_LENGTH}")
+        logger.info(f"最大翻訳長: {MAX_TRANSLATION_LENGTH}")
+        logger.info(f"言語検出信頼度閾値: {LANGUAGE_DETECTION_CONFIDENCE_THRESHOLD}")
+        logger.info(f"日本語文字割合閾値: {JAPANESE_CHARACTER_THRESHOLD}")
+        logger.info(f"URLを無視: {IGNORE_URLS}")
+        logger.info(f"メンションを無視: {IGNORE_MENTIONS}")
 
     async def event_ready(self):
-        print(f'準備完了 | {self.nick}')
-        logging.info(f'準備完了 | {self.nick}')
+        logger.info(f'ログインしました | {self.nick}')
+        await self.wait_for_ready()
+        try:
+            connected_channels = self.connected_channels
+            if connected_channels:
+                logger.info(f"接続中のチャンネル: {[ch.name for ch in connected_channels]}")
+            else:
+                logger.warning("どのチャンネルにも接続していません。")
+        except AttributeError as e:
+            logger.error(f"起動時の情報取得エラー: {e}")
+        except Exception as e:
+            logger.error(f"起動時の予期せぬエラー: {e}", exc_info=True)
+
+        logger.info("Bot is ready!")
 
     async def event_message(self, message):
         if message.echo:
             return
+
         if message.content.startswith('!'):
             await self.handle_commands(message)
-        else:
-            await self.process_message(message)
+            return
 
-    def remove_html_tags(self, text: str) -> str:
-        """HTMLタグを削除する"""
-        return re.sub(r'<[^>]+>', '', text)
-
-    def remove_control_characters(self, text: str) -> str:
-        """制御文字を削除する"""
-        return ''.join(ch for ch in text if unicodedata.category(ch)[0] != 'C')
-
-    def normalize_whitespace(self, text: str) -> str:
-        """空白文字を正規化する"""
-        text = re.sub(r'\s+', ' ', text)
-        return text.strip()
-
-    def remove_symbols(self, text: str) -> str:
-        """記号を削除する"""
-        return re.sub(r'[^\w\s]', '', text)
-
-    def remove_urls_emails_phones(self, text: str) -> str:
-        """URL、メールアドレス、電話番号を削除する"""
-        text = re.sub(r'https?://\S+|www\.\S+', '', text)
-        text = re.sub(r'\S+@\S+', '', text)
-        text = re.sub(r'\d{3}-\d{3}-\d{4}', '', text)
-        return text
-
-    def unicode_normalize(self, text: str) -> str:
-        """Unicode正規化を行う"""
-        return unicodedata.normalize('NFKC', text)
-
-    def preprocess_text(self, text: str) -> str:
-        """
-        テキストの前処理を行う。
-        """
-        try:
-            text = text.encode('utf-8', errors='ignore').decode('utf-8')
-            text = self.remove_html_tags(text)
-            text = self.remove_control_characters(text)
-            text = self.normalize_whitespace(text)
-            text = self.remove_symbols(text)
-            text = self.remove_urls_emails_phones(text)
-            text = self.unicode_normalize(text)
-            text = self.normalize_slang(text)
-            return text
-        except Exception as e:
-            logging.error(f"テキストの前処理中にエラーが発生しました: {e}", exc_info=True)
-            return text
-
-    def normalize_slang(self, text: str) -> str:
-        """
-        スラングを正規化する。
-        """
-        try:
-            slang_dict = {
-                "w": "笑",
-                "草": "笑",
-                "ktkr": "キタコレ",
-            }
-            for slang, normalized in slang_dict.items():
-                text = text.replace(slang, normalized)
-            return text
-        except Exception as e:
-            logging.error(f"スラングの正規化中にエラーが発生しました: {e}", exc_info=True)
-            return text
+        await self.process_message(message)
 
     async def process_message(self, message):
-        """
-        受信したメッセージを処理し、翻訳してチャットに送信する。
-        """
-        content = message.content
+        """通常のチャットメッセージを処理し、必要であれば翻訳する"""
+        user = message.author.name.lower()
+        original_content = message.content.strip()
+        channel_name = message.channel.name
 
-        try:
-            if not self.translation_enabled:
-                return
+        logger.debug(f"[{channel_name}] {user}: {original_content}")
 
-            detected_language = detect_language_ensemble(content)
-            if not detected_language:
-                detected_language = 'ja'
-
-            preprocessed_text = self.preprocess_text(content)
-
-            translated_text, detected_language = await self.translate_message(
-                preprocessed_text, source_language=self.source_language
-            )
-
-            if detected_language != 'ja':
-                await message.channel.send(
-                    f"[{detected_language}] {content} (日本語訳: {translated_text})"
-                )
-
-        except Exception as e:
-            logging.exception(f"メッセージ処理エラー:", exc_info=True)
-            await message.channel.send("メッセージの処理中にエラーが発生しました。")
-
-    async def translate_message(
-        self, text: str, target_language: str = 'ja', source_language: Optional[str] = None
-    ) -> Tuple[str, str]:
-        """
-        メッセージを翻訳し、翻訳されたテキストと検出された言語を返す。
-        翻訳結果はキャッシュに保存される。
-        """
-        if TRANSLATOR is None:
-            return text, 'ja'
-
-        cache_key = (text, target_language, source_language)
-        cached_result = self.translation_cache.get(cache_key)
-
-        if cached_result:
-            logging.info(f"翻訳キャッシュから取得: {text}")
-            return cached_result['translated_text'], cached_result['detected_language']
-
-        for attempt in range(self.translation_retry_count + 1):
-            try:
-                translation = TRANSLATOR.translate(
-                    text, dest=target_language, src=source_language
-                )
-                translated_text = translation.text
-                detected_language = translation.src
-                self.translation_cache.put(
-                    cache_key,
-                    {'translated_text': translated_text, 'detected_language': detected_language},
-                )
-                return translated_text, detected_language
-            except Exception as e:
-                logging.error(
-                    f"翻訳エラー (試行{attempt + 1}/{self.translation_retry_count + 1}): {e}",
-                    exc_info=True,
-                )
-                if attempt < self.translation_retry_count:
-                    await asyncio.sleep(self.translation_retry_delay)  # リトライ待機
-                else:
-                    # await message.channel.send(f"翻訳中にエラーが発生しました: {e}") #messageが定義されていないので削除
-                    return "[翻訳エラー] " + text, 'ja'
-
-    @commands.command(name='set_source_language')
-    async def set_source_language(self, ctx: commands.Context, source_language: str):
-        """
-        翻訳元の言語を設定するコマンド。
-        """
-        if source_language not in self.languages:
-            await ctx.send(
-                f'{ctx.author.name}、無効な言語コードです。翻訳可能な言語コードは、!languages コマンドで確認してください。'
-            )
+        if user in IGNORE_USERS:
+            logger.debug(f"無視ユーザーのためスキップ: {user}")
             return
-        self.source_language = source_language
-        await ctx.send(f'{ctx.author.name}、翻訳元の言語を "{source_language}" に設定しました。')
+        if any(line in original_content for line in IGNORE_LINES):
+            logger.debug(f"無視行パターンのためスキップ: {original_content}")
+            return
 
-    @commands.command(name='toggle_translation')
+        if len(original_content) < MIN_TRANSLATION_LENGTH:
+            logger.debug(f"短すぎるためスキップ ({len(original_content)} < {MIN_TRANSLATION_LENGTH}): {original_content}")
+            return
+        if len(original_content) > MAX_TRANSLATION_LENGTH:
+            logger.info(f"長すぎるためスキップ ({len(original_content)} > {MAX_TRANSLATION_LENGTH}): {original_content}")
+            return
+
+        content_to_process, urls, mentions = remove_urls_mentions(original_content)
+
+        if not content_to_process and (urls or mentions):
+            logger.debug(f"URL/メンションのみのメッセージのためスキップ: {original_content}")
+            return
+
+        if any(word in content_to_process.lower() for word in IGNORE_WORDS):
+            logger.debug(f"無視単語が含まれるためスキップ: {content_to_process}")
+            return
+
+        if content_to_process.lower() in COMMON_SLANGS:
+            logger.debug(f"定型句のためスキップ: {content_to_process}")
+            return
+
+        if not self.translation_enabled:
+            logger.debug("翻訳機能が無効のためスキップ")
+            return
+
+        detected_lang, confidence = detect_language_with_confidence(content_to_process)
+
+        if detected_lang is None and nlp:
+            spacy_lang = detect_language_spacy(content_to_process)
+            if spacy_lang:
+                detected_lang = spacy_lang
+                confidence = 0.9
+                logger.debug(f"spaCyにより言語を決定: {detected_lang}")
+
+        should_translate = False
+        if detected_lang is None:
+            logger.debug(f"言語不明のため翻訳試行: {content_to_process}")
+            should_translate = True
+        elif detected_lang == 'ja' and not contains_significant_japanese(content_to_process, JAPANESE_CHARACTER_THRESHOLD):
+            logger.debug(f"日本語と判定されたが日本語文字が少ないため、翻訳試行: {content_to_process}")
+            should_translate = True
+        elif confidence < LANGUAGE_DETECTION_CONFIDENCE_THRESHOLD:
+            logger.debug(f"言語検出の信頼度が低いため ({confidence:.2f} < {LANGUAGE_DETECTION_CONFIDENCE_THRESHOLD})、翻訳試行: {content_to_process}")
+            should_translate = True
+        else:
+            logger.debug(f"翻訳対象言語 ({detected_lang}, conf={confidence:.2f}): {content_to_process}")
+            should_translate = True
+
+        if should_translate:
+            try:
+                translation_result = await translate(content_to_process, 'ja')
+
+                if translation_result:
+                    translated_text, source_lang = translation_result
+                    if translated_text.strip() == content_to_process.strip():
+                        logger.debug(f"翻訳結果が元テキストと同じため表示スキップ: {translated_text}")
+                    else:
+                        display_lang = source_lang if source_lang != "unknown" else detected_lang if detected_lang else "?"
+                        await message.channel.send(f"{user} ({display_lang.upper()}): {translated_text}")
+                        logger.info(f"翻訳表示: [{channel_name}] {user} ({display_lang.upper()}) -> {translated_text}")
+                else:
+                    logger.warning(f"翻訳に失敗しました (APIエラー等): {content_to_process}")
+
+            except Exception as e:
+                logger.error(f"メッセージ処理中に予期せぬエラーが発生しました: {e}", exc_info=True)
+
+    # --- コマンド ---
+    @commands.command(name='ping')
+    async def ping(self, ctx: commands.Context):
+        await ctx.send(f'Pong! ({round(self.latency * 1000)}ms)')
+
+    @commands.command(name='togglet')
     async def toggle_translation(self, ctx: commands.Context):
-        """
-        翻訳の有効/無効を切り替えるコマンド。
-        """
+        """自動翻訳の有効/無効を切り替えます。"""
+        if not (ctx.author.is_mod or ctx.author.name.lower() == CHANNEL.lower()):
+            await ctx.send("このコマンドは配信者またはモデレーターのみ使用できます。")
+            return
+
         self.translation_enabled = not self.translation_enabled
         status = "有効" if self.translation_enabled else "無効"
-        await ctx.send(f'{ctx.author.name}、翻訳を{status}にしました。')
+        await ctx.send(f"{ctx.author.name}、自動翻訳を{status}にしました。")
+        logger.info(f"自動翻訳が {status} に変更されました by {ctx.author.name}")
 
-    @commands.command(name='tr')
-    async def translate(self, ctx: commands.Context, target_language: str, *, text: str):
-        """
-        指定された言語に翻訳するコマンド。
-        """
-        if TRANSLATOR is None:
-            await ctx.send("翻訳機能が利用できません。")
+    @commands.command(name='jatoen')
+    async def translate_ja_to_en(self, ctx: commands.Context, *, text: str):
+        """日本語テキストを英語に翻訳します。"""
+        try:
+            cleaned_text, _, _ = remove_urls_mentions(text)
+            if not cleaned_text:
+                await ctx.send("翻訳するテキストがありません。")
+                return
+            translation_result = await translate(cleaned_text, 'en')
+            if translation_result:
+                translated_text, source_lang = translation_result
+                await ctx.send(f"{ctx.author.name} (JA->EN): {translated_text}")
+            else:
+                await ctx.send("翻訳に失敗しました。")
+        except Exception as e:
+            logger.error(f"jatoen コマンドエラー: {e}", exc_info=True)
+            await ctx.send(f"翻訳エラーが発生しました: {e}")
+
+    @commands.command(name='clear_cache')
+    async def clear_cache(self, ctx: commands.Context):
+        """翻訳キャッシュをクリアします。"""
+        if not (ctx.author.is_mod or ctx.author.name.lower() == CHANNEL.lower()):
+            await ctx.send("このコマンドは配信者またはモデレーターのみ使用できます。")
             return
+        global translation_cache
+        cache_size_before = len(translation_cache.cache)
+        translation_cache = LRUCache(TRANSLATION_CACHE_SIZE)
+        await ctx.send(f'{ctx.author.name}、翻訳キャッシュをクリアしました。(クリア前: {cache_size_before} 件)')
+        logger.info(f"翻訳キャッシュがクリアされました by {ctx.author.name}")
 
-        if target_language not in self.languages:
-            await ctx.send(
-                f'{ctx.author.name}、無効な言語コードです。翻訳可能な言語コードは、!languages コマンドで確認してください。'
-            )
+    @commands.command(name='translate', aliases=['tr'])
+    async def translate_to_lang(self, ctx: commands.Context, lang_code: str, *, text: str):
+        """指定した言語コードにテキストを翻訳します。"""
+        target_lang = lang_code.lower()
+        if target_lang not in SUPPORTED_LANGUAGES and target_lang != 'ja':
+            await ctx.send(f"サポートされていない言語コードです: {lang_code}。利用可能なコードは `!languages` で確認してください。")
             return
 
         try:
-            translated_text, detected_language = await self.translate_message(
-                text, target_language=target_language
-            )
-            if detected_language != 'ja':
-                await ctx.send(
-                    f'{ctx.author.name}さんのメッセージ: "{text}" ({self.languages[target_language]}訳: "{translated_text}")'
-                )
+            cleaned_text, _, _ = remove_urls_mentions(text)
+            if not cleaned_text:
+                await ctx.send("翻訳するテキストがありません。")
+                return
+            translation_result = await translate(cleaned_text, target_lang)
+            if translation_result:
+                translated_text, source_lang = translation_result
+                await ctx.send(f"{ctx.author.name} ({source_lang.upper()}->{target_lang.upper()}): {translated_text}")
             else:
-                await ctx.send(
-                    f'{ctx.author.name}さんのメッセージ: "{text}" は日本語ではありません。'
-                )
+                await ctx.send("翻訳に失敗しました (APIエラー等の可能性)。")
+
         except Exception as e:
-            logging.error(
-                f"{target_language}への翻訳中にエラーが発生しました: {e}", exc_info=True
-            )
-            await ctx.send(f'{ctx.author.name}、翻訳中にエラーが発生しました: {e}')
+            logger.error(f"translate コマンドエラー: {e}", exc_info=True)
+            await ctx.send(f"翻訳エラーが発生しました: {e}")
 
     @commands.command(name='languages')
-    async def show_languages(self, ctx: commands.Context):
-        """
-        翻訳可能な言語一覧を表示するコマンド。
-        """
-        message = "翻訳可能な言語は以下の通りです:\n"
-        for code, name in self.languages.items():
-            message += f"{code}: {name}\n"
-        await ctx.send(message.strip())
+    async def list_languages(self, ctx: commands.Context):
+        """利用可能な言語コード一覧を表示します。"""
+        try:
+            lang_items = [f"{code}: {name}" for code, name in SUPPORTED_LANGUAGES.items()]
+            max_chars_per_message = 450
+            current_message = "利用可能な言語コード一覧:\n"
+            for item in lang_items:
+                if len(current_message) + len(item) + 1 > max_chars_per_message:
+                    await ctx.send(current_message)
+                    current_message = item + "\n"
+                else:
+                    current_message += item + "\n"
+            if current_message:
+                await ctx.send(current_message)
 
-    @commands.command(name='set_retry')
-    async def set_retry(self, ctx: commands.Context, count: int, delay: int):
-        """
-        翻訳リトライ回数と間隔を設定するコマンド。
-        """
-        if count < 0 or delay < 0:
-            await ctx.send(
-                f'{ctx.author.name}、リトライ回数と間隔は0以上の整数で指定してください。'
-            )
-            return
-        self.translation_retry_count = count
-        self.translation_retry_delay = delay
-        await ctx.send(
-            f'{ctx.author.name}、翻訳リトライを{self.translation_retry_count}回、間隔{self.translation_retry_delay}秒に設定しました。'
-        )
+        except Exception as e:
+            logger.exception(f"言語リスト表示エラー: {e}")
+            await ctx.send(f"言語コード一覧の表示に失敗しました: {e}")
 
-bot = Bot()
-bot.run()
+if __name__ == "__main__":
+    if not os.path.exists("config.py"):
+        logger.warning("設定ファイル config.py が見つかりません。デフォルト設定で動作します。")
+    if nlp is None:
+        logger.warning("spaCy日本語モデルがロードされていないため、spaCyによる言語検出は使用されません。")
+
+    bot = Bot()
+    try:
+        bot.run()
+    except Exception as e:
+        logger.critical(f"Botの実行中に致命的なエラーが発生しました: {e}", exc_info=True)
