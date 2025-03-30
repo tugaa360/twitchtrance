@@ -1,6 +1,3 @@
-make .env file
-Write like that
-import os
-os.environ["TWITCH_CLIENT_ID"] = "あなたのクライアントID"
-os.environ["TWITCH_ACCESS_TOKEN"] = "あなたのアクセストークン"
-os.environ["TWITCH_CHANNEL"] = "あなたのチャンネル名"
+This is a bot that translates comments on Twitch from languages ​​other than Japanese into Japanese.
+Twitchでのコメントで日本語以外の言語を日本語に翻訳するBotです。
+
