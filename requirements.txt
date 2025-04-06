@@ -1,0 +1,6 @@
+python-dotenv
+twitchio
+googletrans==4.0.0rc1  # 特定のバージョンを指定 (安定性を考慮)
+langdetect
+spacy
+ja_core_news_sm
